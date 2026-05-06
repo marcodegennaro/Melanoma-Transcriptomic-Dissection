@@ -1,0 +1,1107 @@
+---
+title: "Marco De Gennaro – NGS Transcriptomics"
+format: pdf
+editor: visual
+---
+
+# Index
+
+Abstract
+
+1.  Experimental design
+
+2.  Data loading and exploratory analysis
+
+3.  Structure discovery and functional interpretation
+
+4.  Transcriptomic group-based predictive analysis
+
+5.  Conclusion, comparison and discussion
+
+6.  Bibliography
+
+# Abstract
+
+### Context, problem and goals
+
+Cutaneous melanoma is characterized by considerable heterogeneity in therapeutic response and prognosis, with targeted therapies often yielding responses that are variable in magnitude and duration. The reference paper analyzed primary and metastatic melanoma samples from the TCGA consortium with the aim of establishing a molecular classification and identifying the biological basis of this variability.
+
+The study addresses three main questions: whether distinct transcriptomic subtypes exist within melanoma, whether these subtypes can be reliably identified from gene expression data, and whether subtype membership carries prognostic significance. The analytical strategy combined consensus hierarchical clustering on the 1,500 most variable genes, differential gene expression (DGE) analysis to characterize each cluster, functional enrichment analysis to interpret cluster identity, and survival analysis to assess clinical relevance.
+
+### Our analysis
+
+Our analysis pursues two objectives: to perform an independent replication on the subset of data provided to us, and to compare our results with those reported in the reference paper. The dataset consists of a `SummarizedExperiment` object with 103 samples; of these, 64 are classified as primary tumors and constitute the focus of our analysis. The paper-defined transcriptomic labels are available in the metadata under the variable `paper_ALL_PRIMARY_VS_METASTATIC`. Starting from these data, we performed exploratory analysis, normalization, consensus clustering, DGE and functional enrichment analysis, a linear model for survival association, and a structured comparison with the paper's results.
+
+# 1. Experimental design
+
+### Material
+
+The study enrolled 331 patients with cutaneous melanoma, of whom 67 (20%) had primary tumors and 266 (80%) had metastatic disease. Tumor samples were selected using clinical criteria supported by histologic review. No explicit within-group stratification is described, though the broad pathological representation supports reasonable statistical power.
+
+### Wet lab methods
+
+RNA sequencing was performed on the Illumina HiSeq 2000 platform using paired-end libraries. mRNA was selected by polyA capture and libraries were constructed with Illumina TruSeq kits, starting from 1 µg of total RNA per sample. Samples with an RNA integrity number (RIN) below 7 were excluded.
+
+### Batch effects
+
+All samples were processed through standardized pipelines at TCGA analysis centers, using a consistent sequencing platform, alignment software, and reference annotations. This upstream standardization limits systematic technical variability. However, no explicit statistical batch correction is reported, and potential batch sources — such as sequencing date or library preparation batch — are not identified in the metadata. Clustering was performed on normalized expression without batch correction, though the authors verified that cluster structure was not driven by tissue type. A posteriori batch correction would be advisable in any reanalysis or meta-analysis.
+
+### Bioinformatic analysis
+
+RNA-seq reads were aligned to the human hg19 genome using MapSplice v0.7.4, a splice-junction-aware aligner. Expression quantification was performed with RSEM, and within-sample normalization used upper quartile scaling.
+
+Consensus hierarchical clustering on the 1,500 most variable genes across 329 samples identified three transcriptomic subtypes: Immune, Keratin, and MITF-low. This approach is well suited to unsupervised classification when the number of groups is not known in advance, and it is robust to the noise typical of bulk RNA-seq data. DGE and enrichment analyses followed standard methods; Kaplan-Meier survival analysis was used to assess the prognostic relevance of the identified classes.
+
+### MIAME compliance
+
+Laboratory protocols and bioinformatic methods are reported in the article. Data are available through the TCGA portal under controlled access. The processing pipeline is documented as the "V2_MapSpliceRSEM workflow," and raw FASTQs, count matrices, metadata, and pipeline specifications are accessible through the portal.
+
+### Evaluation
+
+The Illumina HiSeq 2000 platform provides the sequencing depth and accuracy appropriate for quantitative transcriptomic profiling. The experimental design is well matched to the study goals: isoform reconstruction and novel transcript discovery are not required, and the focus is on expression-level differences between subtypes. The full pipeline is consistent with the official TCGA workflow. The absence of explicit batch correction is a minor limitation, mitigated by the upstream processing standardization.
+
+# 2. Data loading and exploratory analysis
+
+This section covers environment setup, data loading, quality inspection, filtering, and normalization — the preparatory steps that condition the reliability of all downstream analyses.
+
+## 1. Setup, loading and filtering
+
+```{r, include=TRUE, message=FALSE, warning=FALSE}
+library(devtools)
+library(omicsdata)
+library(limma)
+library(EDASeq)
+library(edgeR)
+library(dplyr)
+library(plyr)
+library(corrplot)
+library(ggfortify)
+```
+
+#### Data downloading
+
+```{r}
+data <- fetch_tcga_dataset('SKCM')
+data
+```
+
+#### Data inspection
+
+```{r, message=FALSE}
+assays(data) %>% head(2) # inspect type of data summarized in the experiment
+assay(data, 'raw_count')[1:4, 1:4] %>% head(2)
+rowData(data) %>% head(2)
+colData(data) %>% head(2)
+```
+
+#### Variable Inspection ( paper_RNASEQ.CLUSTER_CONSENHIER )
+
+```{r}
+table(data$paper_RNASEQ.CLUSTER_CONSENHIER, useNA = 'ifany')
+```
+
+There are 37 samples without the transcriptomic definition.
+
+```{r, message=FALSE}
+paper_mask <- grepl("paper_", colnames(colData(data)))
+vars <- colData(data)[, paper_mask]
+summary(data.frame(vars))
+```
+
+The `colData` summary reveals that most NAs are concentrated in the `paper_*` variables (37 samples each), suggesting these are the samples lacking molecular classification in the paper.
+
+```{r}
+colSums(is.na(colData(data)))
+```
+
+We note that most of the NAs are in the variables beginning with paper\_.
+
+#### Data filtering by tumor type
+
+Only primary tumor samples are retained for analysis, as specified by the assignment.
+
+```{r}
+data$paper_ALL_PRIMARY_VS_METASTATIC %>% table(useNA = 'ifany')
+```
+
+There are 37 samples that have no values, 2 metastatic and 64 of interest. We can then filter the data by keeping only the primary tumors.
+
+```{r}
+data <- data[ , !is.na(data$paper_ALL_PRIMARY_VS_METASTATIC) ] # NA removal
+
+data <- data[ , data$paper_ALL_PRIMARY_VS_METASTATIC == 'All_Primaries'] # keep primaries only
+```
+
+```{r}
+df <- data
+rm(data)
+
+table(df$paper_ALL_PRIMARY_VS_METASTATIC, useNA = 'ifany')
+```
+
+Filtering confirmed: 64 primary tumor samples retained.
+
+```{r}
+
+table(df$paper_RNASEQ.CLUSTER_CONSENHIER, useNA = 'ifany')
+```
+
+There is also a sample that did not assign any transcriptomic type among the primary tumors.
+
+#### Data filtering by non zero genes
+
+Before performing the exploratory data analysis (EDA), it is useful to remove genes with zero counts across all samples in order to reduce the computational time and focus the analysis on informative features.
+
+I also removed genes with counts greater than 7 in less than half of the samples.
+
+The statistical motivation is that differential analysis methods rely on dispersion patterns, and genes with few counts or with zeros can make the test less reliable. The biological motivation is that these genes can be considered as artifacts or background noise of sequencing.
+
+```{r}
+raw_count <- assay(df, "raw_count") # Create the raw count matrix
+table(rowSums(raw_count) == 0)  
+```
+
+There are 6896 genes with zero count.
+
+```{r}
+mask1 <- rowSums(raw_count) > 0
+raw_count <- raw_count[mask1, ] 
+df <- df[mask1, ]
+```
+
+Genes with non-zero counts in at least one sample are retained. We now apply a second filter, keeping only genes with counts ≥ 7 in at least half the samples.
+
+```{r}
+mask2 <- rowSums(raw_count >= 7 )  >= ncol(raw_count) / 2 # number of samples with more than 7 count, for every gene in at least half of the samples
+table(mask2) # 19773 genes with more than 7 count in at least half of the samples
+```
+
+```{r}
+df <- df[mask2, ] #remove less than half sample
+df 
+```
+
+```{r}
+raw_count <- raw_count[mask2, ]
+raw_count %>% dim()
+```
+
+Filtering reduced the dataset from 60,600 genes × 103 samples to 19,823 genes × 64 samples. Removing lowly expressed genes reduces noise and improves the reliability of dispersion estimates in downstream differential expression modelling.
+
+## 2. Data visualization: EDA
+
+EDA is performed both before and after normalization to evaluate data quality, detect potential batch effects or outlier samples, and verify that observed variability reflects biology rather than technical artefacts. Before any multivariate analysis, variance stabilization is applied: raw RNA-seq counts exhibit mean-variance dependence (heteroscedasticity), which inflates the influence of highly expressed genes in PCA and clustering. VST from DESeq2 corrects for this more effectively than a simple log transformation and is preferred here (Love et al., 2015).
+
+#### VST application
+
+```{r}
+library(DESeq2)
+dds <- DESeqDataSet(df, design = ~ 1)
+vsd <- vst(dds, blind = TRUE)
+vst_mat <- assay(vsd)
+```
+
+#### Library size distribution
+
+A histogram of per-sample total counts (library size) verifies uniform sequencing depth across samples.
+
+```{r}
+library_sizes <- colSums(raw_count)
+
+ggplot(data = NULL, aes(x = library_sizes, alpha = 0.6)) +
+  geom_histogram(bins = 30, fill = "red", color = "white" ) +
+  labs(
+    title = "Library Size Distribution",
+    x = "Library Size (total counts)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+All samples have library sizes in the \~10\^7 range, confirming adequate and uniform sequencing depth.
+
+#### Boxplot raw count
+
+Per-sample boxplots of log-transformed counts assess distribution comparability. Samples with shifted medians or unusual spread may indicate technical issues.
+
+```{r}
+expr_mat <- raw_count
+colnames(expr_mat) <- substr(colnames(plot), 9, 12)
+col <- df$paper_RNASEQ.CLUSTER_CONSENHIER 
+levels(col)
+levels(col) <- c(1:4)
+
+boxplot(log1p(expr_mat), 
+        col = as.numeric(col),
+        main = 'Log2-Transformed Expression Distributions per Sample',
+        xlab = "Sample", 
+        ylab = "log2 expression",
+        ylim = c(0, 25),
+        las = 2,
+        cex.axis = 0.6)
+```
+
+The distributions are highly comparable across samples, with similar medians and spreads, making batch effects or major quality differences unlikely.
+
+### RLE ( Relative log Expression) plot of vst
+
+The RLE plot shows, for each gene and sample, the deviation from the cross-sample median. Medians should be near zero for well-normalized data, since most genes are expected to be stably expressed.
+
+```{r}
+expr_mat <- vst_mat
+col <- df$paper_RNASEQ.CLUSTER_CONSENHIER
+levels(col) <- c(1:4)
+
+EDASeq::plotRLE(expr_mat, 
+                outline = FALSE,  
+                las=2, 
+                col=col,
+                ylab = "RLE", 
+                main = "VST counts: deviation from median", 
+                xaxt='n')
+```
+
+Medians are centered near zero with comparable interquartile ranges, consistent with well-behaved data and no obvious systematic bias.
+
+#### PCA
+
+PCA projects samples onto principal component axes derived from gene expression variance, providing a linear summary of the data structure. Here samples are colored by the paper-defined transcriptomic labels to assess whether the published clusters are visually separable in our subset.
+
+Therefore, PCA will be performed on the 1500 most variable genes selected from the variance-stabilized transformation (VST) matrix.
+
+#### Most variable genes
+
+```{r}
+gene_var <- apply(vst_mat, 1, var)
+top_genes <- order(gene_var, decreasing = TRUE)[1:1500]
+mat <- vst_mat[top_genes, ]
+```
+
+```{r}
+pca <- prcomp(t(mat))
+summary_pca <- summary(pca) # 64 PCs 
+screeplot(pca, type = c("lines"))
+```
+
+The screeplot shows the first 2–3 PCs capture a substantial fraction of total variance, making a 2D or 3D projection a reasonable summary. From the graph we note that the variance explained by the first two PCs is quite representative of the total variance. It is therefore a robust choice to consider the space defined only by the first 2-3 PCs.
+
+```{r}
+autoplot(pca) # Project samples onto first 2 PCs 
+```
+
+The first two PCs explain approximately 40% of total variance. No clear clustering is apparent, in contrast to what the paper's labels might suggest — a first indication that the subgroup structure may be weak in this subset. As highlighted earlier we note that the first two PCs explain about 40 percent of the total variance in the dataset. What we observe from this graph is that there does not seem to be any particular clustering, in contrast to what we would expect given the analysis done in the paper.
+
+#### First 2 PCs plot
+
+```{r}
+plotPCA(mat, 
+        k = 2, 
+        labels = F, 
+        pch = 20, 
+        isLog = FALSE,
+        col = df$paper_RNASEQ.CLUSTER_CONSENHIER)
+
+legend("topleft", 
+       legend = c('MITF-low',"immune",'keratin'),
+       col = 1:3,
+       bty = "n", 
+       pch = 20, 
+       cex = 0.7, 
+       ncol = 2)
+```
+
+The paper-labeled groups show no clear separation in PC space, confirming the initial observation. Exactly as mentioned earlier there is no clear distinction of groups in principal component space. UMAP is used next to check whether a non-linear projection reveals structure that PCA might miss. We will try to perform a nonlinear dimensionality reduction analysis to see whether this lack of clustering arises from the data or from the type of relationship sought. Further discussion of this will be made in the Conclusion section.
+
+#### First 3 PCs plot
+
+```{r}
+plotPCA(mat, 
+        k = 3, 
+        labels = F, 
+        pch = 20, 
+        isLog = TRUE,
+        col = df$paper_RNASEQ.CLUSTER_CONSENHIER)
+
+legend("topleft", 
+       legend = c('MITF-low',"immune",'keratin'),
+       col = 1:3,
+       bty = "n", 
+       pch = 20, 
+       cex = 0.7, 
+       ncol = 2)
+```
+
+Results in the first three PCs are comparable to the 2D projection: no clear group separation. Here the first 3 PCs were graphed and the results are roughly comparable to the graph of the 2.
+
+### UMAP
+
+UMAP (Uniform Manifold Approximation and Projection) is a non-linear dimensionality reduction technique that preserves local neighbourhood structure. It is useful for visualizing cluster geometry that PCA may not capture. UMAP ( Uniform Manifold Approximation and Projection ) is a nonlinear dimensional reduction technique that, unlike PCA better maintains local relationships. It is particularly used in cluster discovery and preliminary visualization of data structure in the presence of high heterogeneity ( such as an exploratory clustering analysis may be ).
+
+```{r}
+library(uwot)
+set.seed(1645)
+
+umap_input <- t(mat) 
+umap_result <- umap(umap_input,
+                    metric = 'correlation')
+
+umap_df <- data.frame(UMAP1 = umap_result[,1],
+                      UMAP2 = umap_result[,2],
+                      group = df$paper_RNASEQ.CLUSTER_CONSENHIER)
+
+colnames(umap_df)[1:2] <- c("UMAP1", "UMAP2")
+
+ggplot(umap_df, 
+       aes(UMAP1, 
+           UMAP2,
+           color = group)) +
+  geom_point(size = 2) +
+  labs(title = "UMAP of RNA-seq samples") +
+  theme_minimal()
+```
+
+Unlike PCA, UMAP reveals two distinct groups. This suggests some structure exists in the data, though it does not match the three-way classification from the paper. These two groups motivate the choice of k = 2 or 3 in the subsequent clustering step. Even from the nonlinear separation, on our data we do not find a match for the classification provided in the paper. Instead, two distinct groups are noted in contrast to the analysis with PCs. UMAP reveals two groups, suggesting some structure is present. We will test k = 2 and k = 3 in the clustering step.
+
+## 3. Data normalization and transformation
+
+Normalization removes systematic technical variability (library size differences, composition biases) to make gene expression measurements comparable across samples. Two types are applied: within-sample normalization, which corrects for GC content and transcript length, and between-sample normalization, which equates library sizes to allow cross-sample comparisons. The latter is essential for DGE analysis and all multivariate methods. Normalization allows for the removal of variability of technical, nonbiological origin, allowing for maximizing the biological signal, minimizing background noise and avoiding introducing additional bias into the transformed data. There are various technical factors that can bias biological variability including: library size and library preparation method, GC content and transcript length, or even the batch effect that creates systematic variation due to instruments, operators, measurement dates, etc. There are two main categories of normalization: whithin sample normalization, which corrects for within-sample factors such as gene length or GC content, and is useful for comparing genes within the same sample but not suitable for DGE, and between-sample normalization, which removes variation between samples (e.g., library size, global composition), allowing comparison of the same gene between samples and is essential for clustering, PCA and DGE.
+
+### Within-sample normalization
+
+We first check for GC content bias, a common source of systematic within-sample distortion. If present, it would require a dedicated correction step. The preliminary exploratory analysis we will perform will focus on GC content. This step is crucial to identify any bias related to the nucleotide composition of the sequences, which could affect the results of subsequent analyses. The goal is to assess whether we need to apply GC content-based normalization to our dataset in order to obtain more balanced and reliable data.
+
+### GC content
+
+```{r}
+ensid <- as.character(rowRanges(df)$gene_id) #take the gene id from the dataframe and make as character
+ensid <- substr(ensid, 1, 15) # for every gene take the substring of the gene id between 1 and 15 as requested in the next research
+
+gc <- getGeneLengthAndGCContent(id = ensid,
+                                org = "hg19", # genome assembly
+                                mode = "org.db" # mode to retrieve the information
+                                )
+```
+
+The output matrix contains per-gene length and GC content as reported in the hg19 assembly. We now have a matrix with as rows our gene names and as columns the length of the gene as reported in the assembly and the proportion of GC content of that gene.
+
+### GC content inspection
+
+```{r}
+table(!is.na(gc[ , 2])) # we have a lot of NaN ( 15568 ) in the GC content column  
+
+table(!is.na(gc[ , 1])) # the same number of genes doesn't have the lenght
+```
+
+More than half the genes lack GC content annotation in the database. These are removed before the bias assessment. More than half the genes lack GC content annotation. These are removed before the bias assessment.
+
+```{r}
+gc <- gc[!is.na(gc[, 2]), ]  
+
+rowData(df)$ensid <- ensid # Remove the genes without gc content information from the SummarizedExperiment object 
+
+
+df_selected <- df[rowData(df)$ensid  %in% rownames(gc), ] 
+
+raw_count_sel <- assay(df_selected, "raw_count") 
+
+row.names(raw_count_sel) <- row.names(gc)
+```
+
+#### Duplicate checking
+
+```{r}
+table(duplicated(row.names(raw_count_sel))) # there are 19 duplicates
+```
+
+No duplicate gene IDs are present; no further filtering is needed. There are no duplicated genes, we can avoid the filtering.
+
+#### GC visualization
+
+```{r}
+set <- newSeqExpressionSet(raw_count_sel,
+                           phenoData = AnnotatedDataFrame(data.frame(conditions = factor(1:ncol(raw_count_sel)), row.names = colnames(raw_count_sel))),             
+                           
+                           featureData = AnnotatedDataFrame(data.frame(gc = gc[, 2], l = gc[, 1]))) 
+set
+
+s <- EDASeq::biasPlot(set, "gc", ylim = c(0, 10), log = TRUE)
+```
+
+GC content is uniformly distributed across samples, indicating no systematic nucleotide composition bias. Within-sample GC normalization is not required. GC content is uniformly distributed across samples, indicating no systematic nucleotide composition bias. Within-sample GC normalization is not required.
+
+## Between samples normalization
+
+Between-sample normalization with `edgeR` corrects for differences in library size and sample composition. We use the edgeR package to normalize by reducing nonbiological variability due to differences in sequencing depth or sample composition. To normalize, scaling factors must be calculated for each sample to obtain the normalized counts per million ( CPM )
+
+```{r}
+raw_count <- counts(set)
+```
+
+Four normalization methods are computed and compared visually to select the one that best centers sample distributions. We will now apply different methods to calculate normalized CPMs. Eventually we will go on to visualize by exploratory analysis which method maximizes the desired normalization effect. This will be useful for us to use the appropriate method in the dispersion model underlying DEG and enrichment analysis. calcNormFactors() calculates normalization factors for each sample by correcting for composition. These factors are multiplied by the raw library sizes to obtain the normalized library sizes while the cpm() function uses these to calculate the correct Counts Per Million, removing technical variability between samples.
+
+### RLE normalization
+
+RLE is robust to outliers; suitable when few genes are differentially expressed. RLE is robust to outliers and suitable when you do not have too many differentially expressed genes.
+
+```{r}
+lbs <- calcNormFactors(raw_count, method = "RLE")
+
+rle <- cpm(raw_count, lib.size = lbs * colSums(raw_count))
+```
+
+### TMM (Trimmed Mean of M-values)
+
+TMM (Trimmed Mean of M-values): the standard edgeR method.
+
+```{r}
+lbs <- calcNormFactors(raw_count, method = "TMM") 
+tmm <- cpm(raw_count, lib.size = lbs * colSums(raw_count)) 
+```
+
+### Upper quartile
+
+Upper quartile: resistant to the influence of a small number of highly expressed genes. Rather resistant to strong outliers with few strongly expressed genes
+
+```{r}
+lbs <- calcNormFactors(raw_count, method = "upperquartile") 
+uq <- cpm(raw_count, lib.size = lbs * colSums(raw_count))
+```
+
+### Total Count ( un-normalized CPM )
+
+```{r}
+tc <- cpm(raw_count)
+```
+
+### EDA after normalization
+
+RLE plots before and after normalization compare the centering effect of each method. This step allows you to go in and visually compare the effect of the normalizations on the data. From the visual inspection, you will extract the normalization method that you think is most appropriate for these data, and you will maintain this choice in the next steps of the analysis.
+
+#### RLE plot
+
+```{r}
+col <- df_selected$paper_RNASEQ.CLUSTER_CONSENHIER
+levels(col) <- c(1:4)
+
+EDASeq::plotRLE(raw_count, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE before normalization", xaxt='n')
+
+EDASeq::plotRLE(tc, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE with total count", xaxt='n')
+
+EDASeq::plotRLE(tmm, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE with TMM method", xaxt='n')
+
+EDASeq::plotRLE(rle, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE with RLE method", xaxt='n')
+
+EDASeq::plotRLE(uq, outline = FALSE,  las=2, col=col,
+        ylab = "RLE", main = "RLE with upper quartile method", xaxt='n')
+```
+
+All normalization methods perform similarly on this dataset. TMM is selected to match the method used in the reference paper, reducing one source of divergence between the two analyses. Medians are well-centered near zero after normalization, and the IQR remains stable, indicating that biologically relevant variance is preserved. By looking at the RLE plots before and after normalization, we can assess whether the normalization actually played its role, that is, to reduce any nonbiological systematic bias. In particular, we notice that the boxplot medians after normalization are much closer to zero than before. This indicates to us that the data have been correctly centered, eliminating systematic differences between samples. In addition, it is observed that the variability (width of the boxplots, i.e., the IQR) remains roughly unchanged. This suggests that normalization did not alter the internal variance of the samples, thus preserving biologically relevant information that may be useful in subsequent analyses (e.g., identification of differentially expressed genes).
+
+# 3. Structure discovery and functional interpretation
+
+With clean, normalized data in hand, we move to cluster discovery. With clean, normalized data in hand, we move to cluster discovery.
+
+## 1. Clustering
+
+Consensus hierarchical clustering iterates over random gene subsamples, building a consensus co-assignment matrix that reflects cluster stability. This makes it more robust to noise than single-run hierarchical clustering. We use the 1,500 most variable genes (matching the paper's approach), Pearson correlation as the distance metric (capturing co-expression patterns rather than absolute levels), and average linkage. We test k = 2, 3, and 4 with 1,000 iterations and 80% gene sampling per iteration. Clustering is a method of analysis that allows clustering of objects, such as genes or samples, based on their similarity. The goal of clustering is to identify clusters that are very similar internally and very separate from each other. These methods rely on similarity measures such as Euclidean similarity and methods for 'clustering' clusters such as complete linkage that can drastically affect their composition. Internal validation indices that measure the compactness of clusters (internal cohesion) and their separation from each other are used to evaluate the obtained clusters. An aggregate that summarizes both characteristics is the silhouette score, which ranges from -1 to 1, where values close to 1 indicate good clustering, values around 0 an ambiguous separation, and values close to -1 suggest possible assignment errors. Consensus hierarchical clustering was chosen in our analysis because it can identify stable and robust clusters that tend to minimize the noise and random variation present in the data. This method is based on the iterative formation of hierarchical clustering in order to evaluate the consistency of the clusters formed and ensure greater reliability than other non-iterative methods. The 1,500 most variable genes are used, matching the paper's approach. The choice of consensus hierarchical clustering stems from the crucial importance of clustering analysis in our study: without proper identification of homogeneous groups, it would not be possible to identify differentially expressed genes (DEGs), or to investigate their functions in depth, or to perform subsequent analyses correctly.
+
+#### Most Variable genes
+
+The 1,500 most variable genes are selected from the VST matrix. We now select the 1500 most variable genes.
+
+```{r}
+gene_var <- apply(vst_mat, 1, var)
+top_genes <- order(gene_var, decreasing = TRUE)[1:1500]
+mat <- vst_mat[top_genes, ]
+```
+
+#### Consensus Hierarchical Clustering
+
+To identify possible transcriptomic subgroups within our samples, we applied a Consensus Hierarchical Clustering algorithm. This method provides a robust assessment of cluster stability through repeated sampling and aggregation of results. The analysis was performed on the VST array with the 1500 most variable genes. Clustering was performed by testing k = 2,3 or 4 and repeating 1000 iterations for each value. In each iteration 80% of the genes are randomly selected, a similarity matrix calculated, and the data aggregated into a consensus matrix reflecting the stability of the clusters.
+
+We used Pearson correlation as a distance metric because it measures how expression profiles vary in a coordinated manner i.e., taking into account behavior rather than absolute values. The choice is functional because we are interested in identifying similar patterns rather than absolute similarities in expression intensity.
+
+Average linkage as an aggregation method allows us to maintain a trade-off between compactness and sensitivity.
+
+```{r}
+library(ConsensusClusterPlus)
+
+input_data <- mat
+
+results <- ConsensusClusterPlus(
+    d = as.matrix(input_data),
+    maxK = 4,            # max cluster
+    reps = 1000,          # n iteration
+    pItem = 0.8,         # gene fraction / iteration
+    pFeature = 1,        # all the features
+    clusterAlg = "hc",   
+    distance = "pearson",
+    innerLinkage = 'average',
+    seed = 957,
+    plot = 'pdf'
+)
+
+
+clusters <- results[[3]]$consensusClass
+table(clusters)
+```
+
+The consensus matrix heatmap shows, for each sample pair, the proportion of iterations in which they co-clustered. Clear block structure (values near 1 within blocks, near 0 between) indicates stable clustering. To verify that the obtained clusters are well defined we can look at the Consensus Matrix Plot. For each pair of samples it represents the proportion of times they were assigned to the same cluster. A well-defined clustering has blocks with values tending to 1 inside the blocks and tending to 0 outside.
+
+```{r}
+library(pheatmap)
+# Consensus matrix for K = 2
+consensus_matrix <- results[[2]]$consensusMatrix
+pheatmap(consensus_matrix, 
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         main = "Consensus Matrix (K=2)")
+
+consensus_matrix <- results[[3]]$consensusMatrix
+pheatmap(consensus_matrix, 
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         main = "Consensus Matrix (K=3)")
+
+
+consensus_matrix <- results[[4]]$consensusMatrix
+pheatmap(consensus_matrix, 
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         main = "Consensus Matrix (K=4)")  
+```
+
+For k = 2, the consensus matrix shows two well-defined blocks. For k = 3, one of the three blocks is poorly resolved. k = 4 introduces multiple ambiguous boundaries and is ruled out. In our case we note that the clustering performed with k = 2 or 3 shows good separation in the two clusters and, in the case of k= 3, rather poor clustering with weak separation. These results are consistent with what we expected after performing the UMAP. In the graph of the 2 UMAPs, 2 clusters could be clearly distinguished. Clustering with k = 4 is to be ruled out as it has considerable ill-defined zones between clusters. We narrow the choice to k = 2 or k = 3 and compute the silhouette index to quantify cluster quality.
+
+#### Silhouette index
+
+```{r}
+library(cluster)
+data_t <- t(mat)
+clusters2 <- results[[2]]$consensusClass
+clusters <- results[[3]]$consensusClass
+
+dist_mat <- dist(data_t)
+
+sil <- silhouette(clusters2, dist_mat)
+plot(sil, main = "Silhouette Plot per K=2")
+
+sil <- silhouette(clusters, dist_mat)
+plot(sil, main = "Silhouette Plot per K=3")
+```
+
+Mean silhouette scores are 0.21 (k = 2) and 0.14 (k = 3) — both below the 0.25 threshold conventionally considered acceptable, indicating weak cluster separation. Despite using a robust iterative method, the low scores suggest the data contain a weak or continuous structure rather than discrete groups, likely reflecting limited sample size and reduced heterogeneity compared to the full TCGA dataset. To estimate the quality of clustering, we used the silhouette index, a metric that summarizes two properties: cohesion, which represents how similar a sample is to the rest of the group, and separation, which measures how distant it is from the nearest cluster members. A good clustering index is estimated to be between 0.5 and 1. Between 0.25 and 0.5 the results are not robust and below 0.25 very weak with misassigned samples or overlap between groups. In our case, the mean values of silhouette index were 0.21 for k = 2 and 0.14 for k = 3. These scores indicate that the identified clusters are not well separated and that the sample assignments are uncertain. This is true despite the use of a robust iterative method (consensus clustering with 1,000 iterations and sampling 80 percent of the genes), which reinforces the idea that the inherent structure in the data might be weak or continuous rather than discrete or even that the data are insufficient to show this distinction. We proceed with k = 3 to allow comparison with the three-cluster solution reported in the paper, accepting the trade-off between statistical robustness and interpretive alignment. All downstream results should be treated as exploratory. Although there is weak clustering, it was decided to proceed with k = 3 in an attempt to compare the transcriptomic categories reported in the reference paper. It is to be considered that this choice implies a trade-off between statistical consistency and interpretive comparison. Given the purpose of the analysis, it was deemed appropriate to continue with k = 3 taking this into account in the interpretation and reliability of future results.
+
+#### PCA and UMAP
+
+```{r}
+pca <- prcomp(t(mat), scale. = TRUE)
+plot(pca$x[,1:2], 
+     col = results[[3]]$consensusClass, 
+     pch = 19,
+     main = "PCA colored per cluster")
+
+set.seed(2040)
+umap_res <- umap(t(mat), 
+                 scale = TRUE, 
+                 n_neighbors = 15,
+                 min_dist = 0.1, 
+                 metric = "correlation")
+
+# Color by cluster assignment
+plot(umap_res, 
+     col = results[[3]]$consensusClass, 
+     pch = 19, 
+     main = "UMAP colored per cluster",
+     xlab = "UMAP 1", ylab = "UMAP 2")
+```
+
+PCA and UMAP colored by cluster assignment confirm the weak separation seen in the silhouette analysis: groups partially overlap in both linear and non-linear projections. PCA and UMAP colored by cluster assignment confirm the weak separation: groups partially overlap in both linear and non-linear projections.
+
+#### Sample extraction
+
+```{r}
+clusters <- results[[3]]$consensusClass
+
+cluster_df <- data.frame(
+  sample = colnames(mat),
+  cluster = clusters
+)
+```
+
+Cluster assignments are saved in a data frame for downstream use. We have now extracted and saved our clusters in an appropriate data structure in order to perform subsequent analyses.
+
+## 2. Differential Expressed Genes for each cluster
+
+#### Context of differential expression
+
+DEG analysis identifies genes whose mean expression differs significantly between groups. RNA-seq counts are modelled with a negative binomial GLM, which accounts for overdispersion relative to the Poisson distribution: In the context of RNA-seq analysis, the goal of differential gene expression (DEG) analysis is to identify those genes whose expression varies significantly between experimental groups or conditions. It starts with a matrix of counts in which each row represents a gene and each column a sample belonging to a given condition. The basic statistical question is this: for a given gene, does the membership of a sample in a certain condition significantly affect the average expression of that gene? In formal terms, it involves testing whether one or more of the coefficients associated with model covariates (i.e., groups) are significantly different from zero.
+
+Because RNA-seq data consist of discrete counts, the statistical model used is a generalized linear model (GLM) based on a negative binomial distribution. This approach is particularly suitable because it takes into account overdispersion, that is, the extra variability observed in the data compared with that predicted by a simple Poisson distribution. The distribution for each gene $g$ and sample $i$ is formally expressed as:
+
+$Y_{gi}​∼NB(μ_{gi}​,ϕ_g​)$
+
+Where:
+
+-   $Y_{gi}$ : number of reads per gene g in sample i
+
+-   $μ_{gi}​$ : average of gene g in class i
+
+-   $ϕ_g$ : specific dispersion of gene g ( takes into account the overdispersion of the data )
+
+The link function is represented by the log:
+
+$\log(\mu_g) = \log(L_i) + X_i \beta_g$
+
+In this formula, $\log(L_i)$ represents the normalization factor that accounts for the different sequencing depth between samples (i.e., corrects for the total number of reads per sample). The term $X_i$ represents the design matrix with model covariates (such as experimental groups), and $\beta_g$ are the estimated coefficients for each gene, describing the variation (in log-fold change) of expression with respect to conditions.
+
+Since DEG analysis involves testing thousands of genes simultaneously, it would be incorrect to apply a fixed cutoff (such as 0.05) to each p-value, as this would lead to a high number of false positives. To overcome this problem, a correction for multiple comparisons is applied by estimating the False Discovery Rate (FDR).
+
+The FDR represents the expected proportion of false positives among the declared significant results. An FDR value of less than 0.05, for example, indicates that among the claimed differential genes, a maximum of 5 percent false positives are expected. The Benjamini-Hochberg procedure, commonly used to estimate FDR, is based on p-value ordering and is less conservative than other corrections such as Bonferroni, making it suitable for high-dimensionality data such as RNA-seq data.
+
+DEG analysis is applied here to characterize the molecular identity of each cluster. All three pairwise comparisons are run; cluster-specific genes are then defined as those significant in both comparisons involving that cluster (intersection approach). Since this is an exploratory analysis, direction of regulation is not considered.
+
+#### In our analysis
+
+In our case, we want to compare three subtypes identified by clustering analysis on transcriptomic data. The goal is to identify, by differential gene expression analysis, the characteristic genes of each cluster in order to describe their molecular identity and subsequently infer an average functional type. Having three clusters to compare, we will proceed with pairwise differential analyses, that is, we will perform pairwise comparisons among all possible clusters. Once we have obtained the sets of differentially expressed genes for each comparison, we can determine the specific genes in each cluster by subtraction and intersection operations between the results of the different comparisons. This approach will allow us to isolate the most distinctive markers for each transcriptomic subtype.
+
+### Model design
+
+The design matrix includes the three groups without an intercept. TMM normalization factors and NB dispersion are estimated before model fitting. Here we go on to define our design matrix with the clusters of interest. We remove the intercept because we are considering only 3 groups and no other variables. In order to estimate the model parameters we must first calculate the normalization coefficients using the TMM method consistent with what was described earlier and the data dispersion coefficient underlying the negative binomial.
+
+```{r}
+group <- factor(cluster_df$cluster)
+levels(group) <- c("Group_A", "Group_B", "Group_C")  # names
+
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+dge <- DGEList(counts = raw_count)
+dge <- calcNormFactors(dge, method = 'TMM')
+dge <- estimateDisp(dge, design)
+
+
+plotMeanVar(dge, 
+            show.raw.vars = TRUE,
+            show.ave.raw.vars = FALSE,
+            NBline = TRUE,
+            show.tagwise.vars = TRUE
+            )
+```
+
+The mean-variance plot confirms the NB assumption: variance increases faster than the mean (a pattern inconsistent with Poisson), justifying the extra dispersion parameter. The graph is important to verify the key assumption of the model based on the negative binomial distribution that the variance of gene expression increases with the mean but in a nonlinear manner. The black line represents the linear trend in the Poisson distribution case in which the mean equals the variance while the point cloud shows the observed relationship between mean and variance in our data, both in observed and estimated values. As can be seen, the data show a nonlinear relationship between mean and variance, with variance increasing faster than the mean for many genes. This confirms that the assumption of the negative binomial distribution (which introduces an additional dispersion parameter) is better suited to model these data than the Poisson distribution.
+
+#### Model fitting
+
+The GLM is fitted to the count data. The GLM is now fitted to the count data.
+
+```{r}
+fit <- glmFit(dge, design)
+```
+
+### Pairwise comparison
+
+All pairwise comparisons are run using a Likelihood Ratio Test (LRT). Genes with FDR ≤ 0.01 and \|log FC\| \> 1 are retained as significantly differentially expressed. All pairwise comparisons are run with a Likelihood Ratio Test (LRT). Genes with FDR ≤ 0.01 and \|logFC\| \> 1 are retained. The test gives us, for each gene, a logFC value that if positive indicates overexpression in the first group and vice versa. It gives us a significance level for each gene and also the correction in FDR for multiple comparisons. An FDR threshold of 0.01 is chosen in order to obtain particularly significant data because it is accepted that at most 1/100 results said to be significant is actually a false positive. Usually the threshold is 0.01 or 0.05. Cluster-specific genes are defined as the intersection of significant genes across the two comparisons involving each cluster. It is to be considered that given the exploratory purposes of the analysis we will be content not to distinguish between up- or down-regulated genes for each condition.
+
+```{r}
+# Pairwise comparisons
+
+
+# Comparison: Group_A vs Group_B
+contrast_A_B <- makeContrasts(Group_A - Group_B, levels = design) # define contrast
+lrt.A_B <- glmLRT(fit, contrast = contrast_A_B) # Likelihood Ratio Test (model with contrast vs model without)
+top.A_B <- topTags(lrt.A_B, n = Inf)$table # extract table with p-value, FDR, logFC, etc.
+degs.A_B <- top.A_B[top.A_B$FDR <= 0.01, ] # filter genes with high probability of being differentially expressed
+
+# Visualization
+plotMD(lrt.A_B)
+
+plot(top.A_B$logFC, -log10(top.A_B$PValue), 
+     xlab = "logFC", 
+     ylab = "-log10(p-value)")
+
+# Highlight the most differentially expressed genes
+names <- rownames(degs.A_B)
+points(top.A_B[names[1:20], 'logFC'],
+       -log10(top.A_B[names[1:20], 'PValue']),
+       pch = 19,
+       col = 2)
+
+hist(top.A_B$PValue,
+     main = "p-value distribution")
+```
+
+```{r}
+# Comparison: Group_A vs Group_C
+contrast_A_C <- makeContrasts(Group_A - Group_C, levels = design)
+lrt.A_C <- glmLRT(fit, contrast = contrast_A_C)
+top.A_C <- topTags(lrt.A_C, n = Inf)$table
+degs.A_C <- top.A_C[top.A_C$FDR <= 0.01, ]
+plotMD(lrt.A_C)
+hist(top.A_C$PValue,
+     main = "p-value distribution")
+```
+
+```{r}
+# Comparison: Group_C vs Group_B
+contrast_C_B <- makeContrasts(Group_C - Group_B, levels = design)
+lrt.C_B <- glmLRT(fit, contrast = contrast_C_B)
+top.C_B <- topTags(lrt.C_B, n = Inf)$table
+degs.C_B <- top.C_B[top.C_B$FDR <= 0.01, ]
+plotMD(lrt.C_B)
+hist(top.C_B$PValue,
+     main = "p-value distribution")
+```
+
+All three comparisons yield significant DEGs, with roughly balanced numbers of up- and down-regulated genes — consistent with the symmetry assumption underlying TMM normalization. The p-value histogram shows a clear enrichment near zero, confirming genuine differential expression. From the three comparisons and the resulting graphs we can conclude that for each comparison there were differentially expressed genes, about half were over-expressed and the other half under-expressed, consistent with the initial assumption of the model. The histogram of the distribution of p values for each comparison clearly shows that only a small portion are significantly different from zero and therefore differentially expressed. The volcano plot in the first comparison shows that the highlighted genes are those most differentially expressed and with minimal p values ( the - log(p value ) is shown in the y's ).
+
+#### Selection of cluster-specific genes
+
+```{r}
+
+# Specific genes (up or down) for Group_A
+
+A_total_vs_B <- rownames(degs.A_B[abs(degs.A_B$logFC) > 1, ])
+A_total_vs_C <- rownames(degs.A_C[abs(degs.A_C$logFC) > 1, ])
+Group_A_specific_total <- intersect(A_total_vs_B, A_total_vs_C)
+
+# Specific genes (up or down) for Group_B
+B_total_vs_A <- rownames(degs.A_B[abs(degs.A_B$logFC) > 1, ])
+B_total_vs_C <- rownames(degs.C_B[abs(degs.C_B$logFC) > 1, ])
+Group_B_specific_total <- intersect(B_total_vs_A, B_total_vs_C)
+
+# Specific genes (up or down) for Group_C 
+
+C_total_vs_A <- rownames(degs.A_C[abs(degs.A_C$logFC) > 1, ])
+C_total_vs_B <- rownames(degs.C_B[abs(degs.C_B$logFC) > 1, ])
+Group_C_specific_total <- intersect(C_total_vs_A, C_total_vs_B)
+
+# Summary table with the number of specific genes per group
+
+data.frame('Group_A' = length(Group_A_specific_total), 
+           'Group_B' = length(Group_B_specific_total),
+           'Group_C'= length(Group_C_specific_total), 
+           row.names = 'Group Specific Genes')
+```
+
+Group A: 450 specific genes; Group B: 276; Group C: 113. The smaller set for Group C is partly explained by its lower sample count (7 samples), which reduces statistical power. Thresholds used are stringent (FDR ≤ 0.01, \|logFC\| \> 1), so false positives should be limited, though the weak clustering upstream means these genes should be interpreted cautiously. We found 450, 276 and 113 specific genes for Group_A, Group_B, Group_C respectively. We have to take into account first of all that these are the results of stringent thresholds both from the statistical point of view ( FDR \< 0.01 ) which allows us to have a strong reliability of the results, and from the biological point of view with \| log(FC) \| \> 1 which is based on rather weak required expression variation effects. Having a log(FC) \> 1 means that gene expression is at least doubled in the comparison. We also have to take into account that we are talking about clusters related to the same tumor types so we expect that the differences are not so drastic and probably only a few genes separate them sharply. Obviously the size of the dataset also affects the reliability of the results, here, because of the initial filtering we are basing our analysis on only 64 samples with an imbalance between the classes ( Group_C has about half as many samples as the other two )
+
+## 3. Cluster Enrichment Analysis
+
+### Theoretical Background.
+
+Gene set analysis interprets the DEG lists in terms of known biological functions. Two complementary approaches are used: ORA applied to all clusters using GO and KEGG annotations, and GSEA applied to Group A as a sensitivity check. Group C (7 samples) is excluded from enrichment analysis. Gene set analysis (GSA) allows the identification of which groups of genes, associated with specific biological functions or pathways, are significantly enriched in a comparison between conditions or cell groups. There are several approaches to GSA, which can be classified into: Over-Representation Analysis (ORA): assesses whether significantly expressed genes (typically obtained from differential expression analysis) are over-represented in a certain gene set compared to what is expected by chance. It is a relative analysis, based on a significance threshold Gene Set Enrichment Analysis (GSEA): considers the entire gene set sorted (e.g., by logFC), without imposing thresholds, and tests whether genes in a gene set tend to be concentrated at the ends of the ranking. It is an absolute analysis, more sensitive to even weak diffuse patterns. Mixed methods: combine aspects of both approaches to exploit continuous and categorical information in the data. Each approach is based on a different null hypothesis and answers different statistical questions. The results obtained are not directly comparable, and have specific advantages and limitations in terms of accuracy, sensitivity, and robustness.
+
+### In our analysis:
+
+In our case, we have three distinct transcriptomic clusters and are interested in identifying their most represented molecular functions and pathways. To do so, we will perform a gene set analysis separately for each cluster, using two complementary approaches: Over-Representation Analysis (ORA) to identify strongly enriched biological functions and processes among the specific genes in each cluster Gene Set Enrichment Analysis (GSEA) to detect weakly but diffusely enriched functional terms by evaluating the entire gene distribution without thresholds ( only in Group A ) This combined strategy allows us to pick up both strong and specific signals and more subtle but consistent patterns on a transcriptomic scale. Given the low sample size of Group C, which includes only 7 samples out of the 64 under investigation, it was decided not to perform the analysis on this cluster to ensure the statistical robustness of the analysis and to avoid such a low sample size introducing a high number of false positives or false negatives. In order to avoid results that are difficult to interpret, it was preferred to omit it from the analysis. In the concluding section we will carry out a qualitative comparison between the functions found in our analysis and those reported in the reference paper.
+
+### Enviroment setup
+
+```{r, warning=FALSE}
+library(knitr)
+library(DESeq2)
+library(clusterProfiler)
+library(pathview)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+library(ggnewscale)
+library(ggupset)
+library(ggridges)
+```
+
+## Group's Enrichment
+
+#### Group A
+
+```{r, message=FALSE, warning=FALSE}
+# Setup
+
+# Differential expression results for Group A vs B and Group A vs C
+top.A_B <- topTags(lrt.A_B, n = Inf)$table
+degs.A_B <- top.A_B[top.A_B$FDR <= 0.01, ]
+
+top.A_C <- topTags(lrt.A_C, n = Inf)$table
+degs.A_C <- top.A_C[top.A_C$FDR <= 0.01, ]
+
+# Selecting genes with |logFC| > 1 from both comparisons
+A_total_vs_B <- rownames(degs.A_B[abs(degs.A_B$logFC) > 1, ])
+A_total_vs_C <- rownames(degs.A_C[abs(degs.A_C$logFC) > 1, ])
+Group_A_specific_total <- intersect(A_total_vs_B, A_total_vs_C)
+
+# Background gene universe
+universe <- rownames(top.A_B)
+sign <- Group_A_specific_total
+
+# Remove version suffix from ENSEMBL IDs
+universe <- sub("\\..*$", "", universe)
+sign <- sub("\\..*$", "", sign)
+
+# Entrez ID conversion
+library(org.Hs.eg.db)
+
+universe.entrez <- mapIds(org.Hs.eg.db,
+                          keys = universe,
+                          column = 'ENTREZID',
+                          keytype = 'ENSEMBL',
+                          multiVals = 'first')
+
+sign.entrez <- mapIds(org.Hs.eg.db,
+                      keys = sign,
+                      column = 'ENTREZID',
+                      keytype = 'ENSEMBL',
+                      multiVals = 'first')
+
+# Remove NAs
+universe.entrez <- na.omit(as.character(universe.entrez))
+sign.entrez <- na.omit(as.character(sign.entrez))
+```
+
+#### GO enrichment
+
+```{r}
+go.A <- enrichGO(gene = sign.entrez,
+                 universe = universe.entrez,
+                 keyType = 'ENTREZID',
+                 OrgDb = org.Hs.eg.db,
+                 ont = 'BP',
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = 'BH')
+
+dotplot(go.A)
+```
+
+The dotplot shows enrichment of terms related to keratinization and epidermal development, suggesting Group A is transcriptomically associated with a keratinocyte-like differentiation program. In the dotplot we find the enriched terms sorted by significance and allows us to get an overview of more relevant processes in this group. Most of the highlighted processes relate to keratinization or otherwise epidermal development. The ratio gene also allows us to understand the proportion of genes in our set that map to the specific term. The ratio gene also reinforces the hypothesis that in which terms most represented in this group relate to epidermal processes.
+
+```{r}
+
+cnetplot(go.A, showCategory = 10)
+```
+
+The cnetplot reveals multiple genes contributing to overlapping epidermal pathways, consistent with a coordinated differentiation signature. From the category network plot we observe that there are many genes interacting with different pathways indicating the centrality of these functions to the group.
+
+### KEGG enrichment
+
+#### 1. ORA
+
+```{r}
+kk.A <- enrichKEGG(gene = sign.entrez,
+                   universe = universe.entrez,
+                   organism = 'hsa',
+                   keyType = 'ncbi-geneid',
+                   pvalueCutoff = 0.05,
+                   pAdjustMethod = 'BH')
+
+# Visualizations
+dotplot(kk.A)
+
+```
+
+KEGG enrichment differs from GO, with terms related to infection-associated immune signalling (IL-17, arachidonic acid metabolism). This is not necessarily contradictory: in tumor contexts, epithelial barrier genes and immune-regulatory pathways often co-activate. In the KEGG analysis we find different results than those obtained with GO. Here are enriched princially terms related to the response from infections.
+
+```{r}
+cnetplot(kk.A)
+```
+
+The cnetplot shows limited interconnection between enriched pathways, suggesting these KEGG signals are relatively independent. The network shows how pathway enrichment genes are not interconnected indicating a weak representation of these features found by KEGG.
+
+#### 2. GSEA
+
+```{r}
+common_genes <- intersect(rownames(top.A_B), rownames(top.A_C))
+common_genes <- sub("\\..*$", "", common_genes)
+
+avg_logFC <- rowMeans(cbind(top.A_B[common_genes, "logFC"],
+                            top.A_C[common_genes, "logFC"]))
+
+names(avg_logFC) <- mapIds(org.Hs.eg.db, keys = common_genes,
+                           column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first")
+
+avg_logFC <- avg_logFC[!duplicated(names(avg_logFC))]
+avg_logFC <- avg_logFC[!is.na(names(avg_logFC))]
+avg_logFC <- sort(avg_logFC, decreasing = TRUE)
+
+kk2.A <- gseKEGG(geneList = avg_logFC, organism = "hsa", pvalueCutoff = 0.05)
+kk2.A
+```
+
+GSEA on the full ranked gene list recovers overlapping terms (arachidonic acid metabolism, IL-17 signalling), consistent with the ORA results and adding confidence to the Group A functional signature. The fact that the GSEA analysis, related to all genes and no longer just those differentially expressed, also reports results comparable to the ORA analysis gives greater validity to what has been obtained. In this case, the enriched terms are “Arachidonic acid metabolism” “Staphylococcus aureus infection” “IL-17 signaling pathway” “Amoebiasis.”
+
+### Conclusion
+
+Group A is functionally characterized by epidermal differentiation (GO) and immune-related signalling (KEGG/GSEA). The GO and GSEA results are mutually reinforcing. GO analysis showed processes related to epidermal differentiation and epithelial tissue development while KEGG indicated the involvement of immune pathways, such as IL-17 and bacterial infection. These findings are not contradictory: in tumor contexts, numerous immune-related genes also play key functions in epithelial barrier development and maintenance. The fact that there is consistency between the GSEA and ORA results reinforces the group's functional evidence.
+
+## Group B
+
+```{r, message=FALSE}
+top.B_A <- topTags(lrt.A_B, n = Inf)$table
+degs.B_A <- top.B_A[top.B_A$FDR <= 0.01, ]
+
+top.B_C <- topTags(lrt.C_B, n = Inf)$table
+degs.B_C <- top.B_C[top.B_C$FDR <= 0.01, ]
+
+B_total_vs_A <- rownames(degs.B_A[abs(degs.B_A$logFC) > 1, ])
+B_total_vs_C <- rownames(degs.B_C[abs(degs.B_C$logFC) > 1, ])
+Group_B_specific_total <- intersect(B_total_vs_A, B_total_vs_C)
+
+universe <- rownames(top.B_A)
+sign <- Group_B_specific_total
+
+universe <- sub("\\..*$", "", universe)
+sign <- sub("\\..*$", "", sign)
+
+universe.entrez <- mapIds(org.Hs.eg.db, keys = universe, column = 'ENTREZID', keytype = 'ENSEMBL', multiVals = 'first')
+sign.entrez <- mapIds(org.Hs.eg.db, keys = sign, column = 'ENTREZID', keytype = 'ENSEMBL', multiVals = 'first')
+
+universe.entrez <- na.omit(as.character(universe.entrez))
+sign.entrez <- na.omit(as.character(sign.entrez))
+```
+
+#### GO
+
+```{r}
+go.B <- enrichGO(gene = sign.entrez, universe = universe.entrez, keyType = 'ENTREZID', OrgDb = org.Hs.eg.db, ont = 'BP', pvalueCutoff = 0.05, pAdjustMethod = 'BH')
+
+dotplot(go.B)
+
+```
+
+GO terms are dominated by lymphocyte and leukocyte regulation, MHC class processes, and T cell signalling — a clear immune activation signature. Most of the processes highlighted concern the regulation of lymphocytes or leukocytes, regulation of MHC or T cells, thus all processes related to immunity. The rateo gene also reinforces the hypothesis that in which terms most represented in this group relate to epidermal processes.
+
+```{r}
+cnetplot(go.B, showCategory = 10)
+```
+
+The cnetplot shows dense gene-pathway interconnections, reflecting the centrality of immune response functions to this cluster. From the category network plot we observe that there are many genes that interact with different pathways indicating the centrality of these functions to the group.
+
+#### KEGG
+
+```{r}
+kk.B <- enrichKEGG(gene = sign.entrez, universe = universe.entrez, organism = 'hsa', keyType = 'ncbi-geneid', pvalueCutoff = 0.05, pAdjustMethod = 'BH')
+
+
+dotplot(kk.B)
+```
+
+KEGG confirms the same trend: T cell differentiation and related immune events are the most enriched pathways. The analysis performed with KEGG also reveals the same trands highlighted with GO. We have genes involved with T cell differentiation and other immune events.
+
+```{r}
+cnetplot(kk.B)
+```
+
+Gene interconnections in the cnetplot further support an immune-dominant functional identity for Group B. The graph shows the interconnection of genes among the various enriched functions. This information suggests that the subgroup has genes typical of the immune response.
+
+### Conclusion
+
+Group B is characterized by immune response functions, consistent with active lymphocyte infiltration in the tumor microenvironment. From the analysis just performed, the B group would appear to be characterized by functions associated with immune events.
+
+### Enrichment conclusion
+
+Functional enrichment identifies Group A as epithelial-like and Group B as immune-enriched. These results are consistent with known axes of melanoma biology and with the paper's Keratin and Immune cluster descriptions. Given the weak clustering, however, enrichment results should be treated as hypothesis-generating rather than definitive. We were able to attribute to the genes specific for the 2 clusters molecular functions and thus processes that are supposed to be most represented within each group. However, these interpretations must be taken into account in light of the limitations previously stated in clustering. The fact that we found different molecular functions, by GE and KEGG, in cluster A could also be a consequence of the approximation of our clustering.
+
+# 4. Transcriptomic group-based predictive analysis
+
+Having characterized the molecular identity of each cluster, we ask whether cluster membership is associated with patient survival after sample collection. After identifying the genes and biological functions associated with the various transcriptomic clusters, we asked a predictive question: is there an association between membership in a specific transcriptomic cluster and the survival time of patients after sampling? A linear model is used, with days to death as the outcome and cluster membership as the predictor, adjusted for sex and age at diagnosis. Days to death is used as a first-order proxy for post-sampling survival time; a Kaplan-Meier approach would be more appropriate but falls outside the scope of this analysis. To answer this question, we decided to build a linear model. In our model, the dependent variable, that is, the one we want to predict, is the number of days between sampling and the patient's death. This figure represents an indicator of post-sampling survival time. The independent variable, on the other hand, is a binary variable, which encodes the patient's membership in one of the two main groups identified by transcriptomic clustering. We chose this configuration for the model because the response variable, i.e., the number of days, is continuous, and it is of interest to investigate whether there is a significant difference in the expected value of this variable as a function of transcriptomic group membership.
+
+### Important considerations
+
+Days to death does not account for patient age or clinical status at sampling, and does not distinguish deaths from other causes. These are known limitations of using this variable as a survival proxy. It should be emphasized that the use of the number of post-sampling days as an indirect measure of survival has limitations. In particular, this approach does not take into account crucial factors such as the patient's age or clinical status at the time of sampling. However, it was felt that as a first approximation this model would do sufficiently well.
+
+## Linear Model
+
+```{r, warning=FALSE}
+days_to_death <- as.integer(df$paper_CURATED_DAYS_TO_DEATH_OR_LAST_FU)
+group <- as.factor(cluster_df$cluster)
+
+
+
+model <- data.frame(days_to_death = days_to_death, 
+                    group = group,
+                    age = df$age_at_diagnosis,
+                    sex = df$gender,
+                    ethnicity = df$ethnicity)
+rownames(model) <-  rownames(colData(df))
+
+model <- model %>% 
+  filter(group != '3')
+
+
+ggplot(model,
+       aes(days_to_death,
+           fill = group))+
+  labs(title = 'Histogram of days to death colored by group')+
+  geom_histogram()
+```
+
+The distribution of days to death does not differ visibly between groups, consistent with the subsequent model result. The survival histogram shows no obvious distributional difference between groups. The model result below provides a formal test.
+
+```{r}
+fit <- lm(days_to_death ~ group + sex + age, data = model)
+summary(fit)
+```
+
+The linear model shows a non-significant F-statistic (p = 0.109), providing no evidence of an association between cluster membership and post-sampling survival time in this dataset. Given the small sample size and weak cluster separation, this result is expected and not informative about the underlying biology. The output of the linear model (LM) shows that the F-statistic is not significant (p-value = 0.109), indicating that our model does not explain a significantly larger variance than the base model, which consists only of the intercept. This result suggests that there is insufficient evidence in our data to reject the null hypothesis that there is no significant difference in mean days to death in relation to membership in a specific transcriptomic group.
+
+# 5. Conclusion, Comparison and Discussion
+
+The analysis identified two transcriptomically distinct clusters from 64 primary melanoma samples, characterized their specific genes by pairwise DGE, assigned functional identities through enrichment analysis, and tested for a survival association. We identified the clusters in our data, defined their specific genes, defined their most represented functions, and tried to understand whether they are associated with mortality. The analysis identified two transcriptomically distinct clusters from 64 primary melanoma samples, characterized their specific genes by pairwise DGE, assigned functional identities through enrichment analysis, and tested for a survival association.
+
+## 1. **Biological interpretation**
+
+Enrichment results indicate that Group A is associated with keratinocyte differentiation and epidermal development, while Group B shows strong immune activation — processes consistent with known axes of melanoma biology (epithelial-like vs. immune-infiltrated tumor microenvironments). No significant association was found between cluster membership and post-sampling survival in this dataset. The results of functional enrichment analysis show that cluster “A” highlights activation of epithelial and keratinocyte differentiation genes, potentially associated with a primary cutaneous origin. Cluster “B” is characterized by strong activation of the adaptive and innate immune system, suggesting active infiltration of immune cells into the tumor micro-environment. This pattern are consistent with expected tumor microenvironment variability. It reflects known axes of melanoma biology: immune infiltration vs. cellular differentiation.\
+Such classification supports stratification for prognostic and therapeutic applications. These findings confirm and extend what was described in the original article, reinforcing the idea that molecular classification of melanoma may have prognostic implications. Based on the available data, no clear associations emerge between the identified molecular clusters and post-sampling date of death.
+
+#### Summary Table
+
+The table below summarizes the molecular identities assigned to each group: We can now show a summary table of the groups and their functions:
+
+```{r}
+data.frame(Cluster = c('Group A', 'Group B'),
+           GO_terms = c('Epidermal development', 'Immune response'),
+           KEGG_pathway = c('Arachidonic acid', 'T differentiation'),
+           Biological_Characterization = c('Epithelial-like', 'Immune'))
+```
+
+#### Graphical visualization
+
+```{r}
+library(gridExtra)
+
+p1 <- barplot(go.A, showCategory = 10, title = "Group A") +
+  theme(axis.text.y = element_text(size = 6))  
+
+p2 <- barplot(go.B, showCategory = 10, title = "Group B") +
+  theme(axis.text.y = element_text(size = 6))
+
+p3 <- dotplot(kk.A) +
+  theme(axis.text.y = element_text(size = 6))
+
+p4 <- dotplot(kk.B) +
+  theme(axis.text.y = element_text(size = 6))
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+## **2. Paper comparison**
+
+#### Cluster comparison
+
+The contingency table below compares our cluster assignments with the paper's three-class solution:
+
+```{r}
+table(Our = cluster_df$cluster, Paper = df$paper_RNASEQ.CLUSTER_CONSENHIER)
+```
+
+The overlap is limited: our Group A captures roughly half of the paper's Keratin cluster, while Group B aggregates samples from all three paper clusters, and Group C maps mainly to the Immune cluster. The low correspondence is expected given the smaller, less heterogeneous dataset.
+
+#### Functional comparison
+
+Functionally, the paper's Keratin, Immune, and MITF-low groups are expected to show epidermal, immune, and pigmentation/migration signals respectively. Our Group A aligns functionally with the Keratin group (epidermal GO terms), and Group B with the Immune group (lymphocyte signalling). The mismatch between functional alignment and sample-level overlap in the contingency table suggests that some key transcriptomic signals are recoverable even in a smaller, less heterogeneous subset, but that the cluster boundaries shift considerably.
+
+In light of this, we can hypothesize that our group A is functionally associated with the ‘Keratin’ group described in the original study, while group B shows similarities with the ‘Immune’ group. It is interesting to note that this functional correspondence is not reflected in the comparative table. In fact, considering the criterion by which we defined the groups, based on gene intersection, we would have expected a greater similarity with the ‘MITF-low’ group, as also suggested by the contingency table comparing our analysis with that of the paper. \## 3. Discussion The goal of this work was to perform an independent transcriptomic analysis on a primary melanoma subset from TCGA and compare the results with those of the reference paper. The pipeline included consensus hierarchical clustering, pairwise DGE, functional enrichment, and a linear survival model. Our dataset contained 64 primary tumor samples — roughly one fifth of the 330 used in the paper, and lacking the metastatic samples that add heterogeneity to the full cohort. This reduced size and homogeneity directly affected clustering quality: mean silhouette scores below 0.25 indicate weak group separation, which propagates uncertainty through all downstream analyses. The dataset available to us contained only 103 samples of which about fifty lacked much metadata and 64 classified as primary tumors on which we were asked to focus. Compared to the 330 samples used in the paper, it is obvious that we went to consider only a minimal portion of the molecular variability available to researchers. Moreover, even from a qualitative point of view, our data differed from those in the paper in that data from metastatic tumors were present among theirs, making the dataset more heterogeneous. Cluster-to-paper overlap is limited, as expected. The more interesting observation is that some key functional signals (epidermal differentiation in one cluster, immune activation in another) are partially conserved despite the different clustering. This raises the question of whether these transcriptomic signals are intrinsically robust, or whether they arise as artefacts of enrichment analysis applied to weakly defined groups. Taken together, this analysis illustrates the sensitivity of unsupervised transcriptomic classification to dataset size and composition. A subset analysis can still recover biologically plausible signals, but the reliability of conclusions is fundamentally constrained by data quality. Future directions include extending the analysis to the full 103-sample dataset after investigating the missing metadata, replacing the linear survival model with a proper Kaplan-Meier analysis, and exploring pharmacogenomic implications of the identified subtypes. It would have been interesting to perform the analysis on the rest of the data available to us as well after delving into the causes of the high amount of missing values in the metadata. Expanding the available data would improve both the robustness and, probably, the agreement with the results of the paper. Another interesting analysis concerns the survival analysis we performed with a linear model but potentially refined by a Kaplan-Meier model specifically for this type of question. Another interesting question concern pharmacogenomic exploration with the aim of identify molecular-based therapy. \# 6. Bibliography
+
+1.  **Cancer Genome Atlas Network. Genomic Classification of Cutaneous Melanoma**. Cell. 2015 Jun 18;161(7):1681-96. doi: 10.1016/j.cell.2015.05.044. PMID: 26091043; PMCID: PMC4580370.
+2.  Love MI, Anders S, Kim V, Huber W. **RNA-Seq workflow: gene-level exploratory analysis and differential expression.** F1000Res. 2015 Oct 14;4:1070. doi: 10.12688/f1000research.7035.1. PMID: 26674615; PMCID: PMC4670015.
